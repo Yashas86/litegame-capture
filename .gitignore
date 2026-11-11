@@ -1,0 +1,51 @@
+# Recordings & Media Output
+recordings/
+*.mp4
+*.mkv
+*.h264
+*.pcm
+*.wav
+*.idx
+*.csv
+
+# Windows Build, Runtimes & Tooling
+windows/dist/
+windows/build/
+windows/__pycache__/
+windows/*.spec.bak
+windows/gstreamer_runtime/
+windows/ffmpeg.exe
+windows/ffprobe.exe
+platform-tools/
+windows/test_ff_tmp/
+windows/test_dur_sync_*/
+windows/test_*_out*/
+windows/test_output*/
+windows/test_stream_output*/
+
+# Android Build, IDE & Signing Secrets
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.apk
+*.aab
+*.ap_
+*.dex
+*.keystore
+*.jks
+*.pem
+*.p12
+
+# IDE & Local Environment
+.idea/
+android/.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+.env
+.env.*
+__pycache__/
+*.py[cod]

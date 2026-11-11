@@ -380,10 +380,12 @@ class ReceiverCore:
                         if self.video_resolution is None:
                             self.video_resolution = _parse_sps_resolution(payload)
                         with self._preview_lock:
-                            if len(self._codec_config_packets) < 8:
+                            if payload not in self._codec_config_packets and len(self._codec_config_packets) < 8:
                                 self._codec_config_packets.append(payload)
                                 self.preview_decoder.set_codec_config(self._codec_config_packets)
                     else:
+                        if self.video_resolution is None and (flags & 1) != 0:
+                            self.video_resolution = _parse_sps_resolution(payload)
                         if self.first_video_pts is None:
                             self.first_video_pts = pts_us
                         self.last_video_pts = pts_us

@@ -22,6 +22,7 @@ import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.os.Bundle
 import android.os.IBinder
 import android.os.Process
 import android.util.Log
@@ -124,6 +125,12 @@ class CaptureService : Service() {
     private var isVideoEOS: Boolean = false
 
     @Volatile
+    private var recordingTimelineReady: Boolean = false
+
+    @Volatile
+    private var virtualDisplayReadyNs: Long = 0L
+
+    @Volatile
     private var writerClosing: Boolean = false
 
     private var videoDrainThread: Thread? = null
@@ -218,9 +225,11 @@ class CaptureService : Service() {
     }
 
     private fun startCapture(resultCode: Int, data: Intent) {
-        captureStartNs = System.nanoTime()
+        captureStartNs = 0L
         lastVideoPtsUs = -1L
         isVideoEOS = false
+        recordingTimelineReady = false
+        virtualDisplayReadyNs = 0L
 
         val s = Socket()
         s.connect(InetSocketAddress("127.0.0.1", PORT), 5000)
@@ -263,9 +272,11 @@ class CaptureService : Service() {
             null,
             null
         )
+        virtualDisplayReadyNs = System.nanoTime()
+        requestSyncFrame(codec)
 
-        startAudioCapture(mp)
         videoDrainThread = thread(name = "VideoDrain") { drainVideo(codec) }
+        startAudioCapture(mp)
     }
 
     private fun createEncoder(): MediaCodec {
@@ -300,11 +311,46 @@ class CaptureService : Service() {
         return if (reused != null && reused.size >= minSize) reused else ByteArray(minSize.coerceAtLeast(65536))
     }
 
+    private fun requestSyncFrame(codec: MediaCodec) {
+        try {
+            val params = Bundle()
+            params.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+            codec.setParameters(params)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun containsIdrNal(data: ByteArray, length: Int): Boolean {
+        val limit = length.coerceAtMost(2048)
+        var i = 0
+        while (i + 3 < limit) {
+            if (data[i] == 0.toByte() && data[i + 1] == 0.toByte()) {
+                val startLen = when {
+                    data[i + 2] == 1.toByte() -> 3
+                    i + 4 < limit && data[i + 2] == 0.toByte() && data[i + 3] == 1.toByte() -> 4
+                    else -> 0
+                }
+                if (startLen > 0) {
+                    val nalPos = i + startLen
+                    if (nalPos < limit && (data[nalPos].toInt() and 0x1F) == 5) {
+                        return true
+                    }
+                    i = nalPos + 1
+                    continue
+                }
+            }
+            i++
+        }
+        return false
+    }
+
     private fun drainVideo(codec: MediaCodec) {
         Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY)
         val info = MediaCodec.BufferInfo()
-        val captureStartUs = captureStartNs / 1000L
         var videoPtsOffsetUs = Long.MIN_VALUE
+        var sentFormatCsd = false
+        var lastSyncRequestNs = 0L
+        val minValidIdrBytes = if (captureWidth >= 1920) 2500 else 1500
 
         try {
             while (running.get()) {
@@ -318,6 +364,7 @@ class CaptureService : Service() {
                     when {
                         index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                             val fmt = codec.outputFormat
+                            var emittedAny = false
                             for (key in listOf("csd-0", "csd-1")) {
                                 val csd = fmt.getByteBuffer(key)
                                 if (csd != null && csd.remaining() > 0) {
@@ -325,8 +372,19 @@ class CaptureService : Service() {
                                     val size = dup.remaining()
                                     val bytes = ByteArray(size)
                                     dup.get(bytes)
-                                    enqueuePacket(TRACK_VIDEO, MediaCodec.BUFFER_FLAG_CODEC_CONFIG, 0L, bytes, size, pooled = false)
+                                    enqueuePacket(
+                                        TRACK_VIDEO,
+                                        MediaCodec.BUFFER_FLAG_CODEC_CONFIG,
+                                        0L,
+                                        bytes,
+                                        size,
+                                        pooled = false
+                                    )
+                                    emittedAny = true
                                 }
+                            }
+                            if (emittedAny) {
+                                sentFormatCsd = true
                             }
                         }
                         index >= 0 -> {
@@ -338,29 +396,67 @@ class CaptureService : Service() {
                                 buffer.get(buf, 0, info.size)
 
                                 val isConfig = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
-                                val ptsUs = if (isConfig) {
-                                    lastVideoPtsUs.coerceAtLeast(0L)
+                                val hasIdr = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0 ||
+                                    containsIdrNal(buf, info.size)
+
+                                if (isConfig && !hasIdr) {
+                                    if (!sentFormatCsd) {
+                                        sentFormatCsd = true
+                                        val cfgPtsUs = lastVideoPtsUs.coerceAtLeast(0L)
+                                        enqueuePacket(TRACK_VIDEO, info.flags, cfgPtsUs, buf, info.size, pooled = true)
+                                    } else {
+                                        recyclePayload(TRACK_VIDEO, buf, pooled = true)
+                                    }
+                                } else if (!recordingTimelineReady) {
+                                    val nowNs = System.nanoTime()
+                                    if (!hasIdr) {
+                                        recyclePayload(TRACK_VIDEO, buf, pooled = true)
+                                        if (nowNs - lastSyncRequestNs > 200_000_000L) {
+                                            lastSyncRequestNs = nowNs
+                                            requestSyncFrame(codec)
+                                        }
+                                    } else {
+                                        val sinceVdMs = if (virtualDisplayReadyNs > 0L) {
+                                            (nowNs - virtualDisplayReadyNs) / 1_000_000L
+                                        } else {
+                                            9999L
+                                        }
+                                        if (sinceVdMs <= 450L && info.size < minValidIdrBytes) {
+                                            Log.i(
+                                                TAG,
+                                                "Skipping startup blank IDR (${info.size}B at ${sinceVdMs}ms); requesting sync frame"
+                                            )
+                                            recyclePayload(TRACK_VIDEO, buf, pooled = true)
+                                            lastSyncRequestNs = nowNs
+                                            requestSyncFrame(codec)
+                                        } else {
+                                            val nowUs = nowNs / 1000L
+                                            val rawPtsUs = info.presentationTimeUs
+                                            val anchorNs = if (abs(rawPtsUs - nowUs) < 2_000_000L) {
+                                                rawPtsUs * 1000L
+                                            } else {
+                                                nowNs
+                                            }
+                                            captureStartNs = anchorNs
+                                            videoPtsOffsetUs = rawPtsUs
+                                            lastVideoPtsUs = 0L
+                                            val outFlags = info.flags or MediaCodec.BUFFER_FLAG_KEY_FRAME
+                                            recordingTimelineReady = true
+                                            enqueuePacket(TRACK_VIDEO, outFlags, 0L, buf, info.size, pooled = true)
+                                        }
+                                    }
                                 } else {
                                     val nowRelUs = ((System.nanoTime() - captureStartNs) / 1000L).coerceAtLeast(0L)
                                     if (videoPtsOffsetUs == Long.MIN_VALUE) {
-                                        val candidateUs = info.presentationTimeUs - captureStartUs
-                                        videoPtsOffsetUs = if (
-                                            candidateUs in -1_000_000L..10_000_000L &&
-                                            abs(candidateUs - nowRelUs) < 2_000_000L
-                                        ) {
-                                            captureStartUs
-                                        } else {
-                                            info.presentationTimeUs - nowRelUs
-                                        }
+                                        videoPtsOffsetUs = info.presentationTimeUs - nowRelUs
                                     }
                                     var normalized = (info.presentationTimeUs - videoPtsOffsetUs).coerceAtLeast(0L)
                                     if (lastVideoPtsUs >= 0L && normalized <= lastVideoPtsUs) {
                                         normalized = lastVideoPtsUs + 1L
                                     }
                                     lastVideoPtsUs = normalized
-                                    normalized
+                                    enqueuePacket(TRACK_VIDEO, info.flags, normalized, buf, info.size, pooled = true)
                                 }
-                                enqueuePacket(TRACK_VIDEO, info.flags, ptsUs, buf, info.size, pooled = true)
                             }
                             codec.releaseOutputBuffer(index, false)
                         }
@@ -466,18 +562,27 @@ class CaptureService : Service() {
         var expectedNextPtsUs = -1L
         val audioTs = AudioTimestamp()
 
+        val frameBytes = 2 * channels
         while (running.get()) {
             val buffer = pool.poll() ?: ByteArray(chunkBytes)
             val read = record.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
             if (read > 0) {
                 val readDoneNs = System.nanoTime()
-                val aligned = read - (read % (2 * channels))
+                val aligned = read - (read % frameBytes)
                 if (aligned > 0) {
-                    val frameCount = aligned / (2 * channels)
-                    val chunkDurUs = (frameCount * 1_000_000L) / sampleRate
-                    val wallStartUs = (((readDoneNs - captureStartNs) / 1000L) - chunkDurUs).coerceAtLeast(0L)
+                    val frameCount = aligned / frameBytes
+                    val anchorNs = captureStartNs
+                    if (!recordingTimelineReady || anchorNs <= 0L) {
+                        framesRead += frameCount
+                        if (pool.size < MAX_POOL_BUFFERS) {
+                            pool.offer(buffer)
+                        }
+                        continue
+                    }
 
-                    var anchoredUs = wallStartUs
+                    val chunkDurUs = (frameCount * 1_000_000L) / sampleRate
+                    val rawWallStartUs = ((readDoneNs - anchorNs) / 1000L) - chunkDurUs
+                    var anchoredUs = rawWallStartUs
                     val tsResult = try {
                         record.getTimestamp(audioTs, AudioTimestamp.TIMEBASE_MONOTONIC)
                     } catch (_: Exception) {
@@ -486,23 +591,48 @@ class CaptureService : Service() {
                     if (tsResult == AudioRecord.SUCCESS && audioTs.nanoTime > 0L) {
                         val hwChunkStartNs =
                             audioTs.nanoTime + ((framesRead - audioTs.framePosition) * 1_000_000_000L) / sampleRate
-                        val hwPtsUs = ((hwChunkStartNs - captureStartNs) / 1000L).coerceAtLeast(0L)
-                        if (abs(hwPtsUs - wallStartUs) <= 150_000L) {
-                            anchoredUs = hwPtsUs
+                        val rawHwPtsUs = (hwChunkStartNs - anchorNs) / 1000L
+                        if (abs(rawHwPtsUs - rawWallStartUs) <= 150_000L) {
+                            anchoredUs = rawHwPtsUs
                         }
                     }
 
-                    val ptsUs = if (expectedNextPtsUs < 0L) {
-                        anchoredUs
-                    } else if (abs(anchoredUs - expectedNextPtsUs) <= 45_000L) {
-                        expectedNextPtsUs
-                    } else {
-                        maxOf(anchoredUs, expectedNextPtsUs)
+                    framesRead += frameCount
+                    if (anchoredUs + chunkDurUs <= 0L) {
+                        if (pool.size < MAX_POOL_BUFFERS) {
+                            pool.offer(buffer)
+                        }
+                        continue
                     }
 
-                    expectedNextPtsUs = ptsUs + chunkDurUs
-                    framesRead += frameCount
-                    enqueuePacket(trackId, 0, ptsUs, buffer, aligned, pooled = true)
+                    var emitBytes = aligned
+                    var emitStartUs = anchoredUs
+                    if (emitStartUs < 0L) {
+                        val skipUs = -emitStartUs
+                        val skipFrames = ((skipUs * sampleRate) / 1_000_000L).toInt().coerceAtMost(frameCount)
+                        val skipBytes = skipFrames * frameBytes
+                        emitBytes -= skipBytes
+                        if (emitBytes <= 0) {
+                            if (pool.size < MAX_POOL_BUFFERS) {
+                                pool.offer(buffer)
+                            }
+                            continue
+                        }
+                        System.arraycopy(buffer, skipBytes, buffer, 0, emitBytes)
+                        emitStartUs += (skipFrames * 1_000_000L) / sampleRate
+                    }
+
+                    val emitDurUs = ((emitBytes / frameBytes) * 1_000_000L) / sampleRate
+                    val ptsUs = if (expectedNextPtsUs < 0L) {
+                        emitStartUs
+                    } else if (abs(emitStartUs - expectedNextPtsUs) <= 45_000L) {
+                        expectedNextPtsUs
+                    } else {
+                        maxOf(emitStartUs, expectedNextPtsUs)
+                    }
+
+                    expectedNextPtsUs = ptsUs + emitDurUs
+                    enqueuePacket(trackId, 0, ptsUs, buffer, emitBytes, pooled = true)
                 } else if (pool.size < MAX_POOL_BUFFERS) {
                     pool.offer(buffer)
                 }

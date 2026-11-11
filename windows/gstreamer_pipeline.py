@@ -158,6 +158,28 @@ def _get_gst_runtime() -> _GstRuntime:
         return _GST_RUNTIME
 
 
+def _contains_idr_nal(data: bytes) -> bool:
+    """Return True if an Annex-B byte slice contains an H.264 IDR NAL unit (type 5)."""
+    n = len(data)
+    i = 0
+    while i + 3 < n:
+        if data[i] == 0 and data[i + 1] == 0:
+            if data[i + 2] == 1:
+                nal_pos = i + 3
+                if nal_pos < n and (data[nal_pos] & 0x1F) == 5:
+                    return True
+                i = nal_pos + 1
+                continue
+            if i + 4 < n and data[i + 2] == 0 and data[i + 3] == 1:
+                nal_pos = i + 4
+                if nal_pos < n and (data[nal_pos] & 0x1F) == 5:
+                    return True
+                i = nal_pos + 1
+                continue
+        i += 1
+    return False
+
+
 def _group_nals_into_access_units(nals):
     units = []
     pending_config = bytearray()
@@ -464,10 +486,52 @@ class GStreamerPipeline:
         if not v_raw:
             return [], [], [], 0, 16_666_667, None
 
-        v_media_pts0 = next((pts for pts, fl, _, _ in v_raw if (fl & 2) == 0), None)
-        if v_media_pts0 is None:
+        # Deduplicate identical codec configs and trim any pre-IDR delta frames before Sample 0
+        v_cfg = []
+        v_media = []
+        seen_cfgs = set()
+        found_first_idr = False
+        first_idr_idx = None
+        v_file_size = video_path.stat().st_size
+
+        with open(video_path, "rb") as vfh:
+            for pts_us, fl, offset, size in v_raw:
+                if offset >= v_file_size:
+                    continue
+                actual_size = min(size, v_file_size - offset)
+                if actual_size <= 0:
+                    continue
+                if (fl & 2) != 0:
+                    vfh.seek(offset)
+                    cfg_bytes = vfh.read(min(actual_size, 8192))
+                    if _contains_idr_nal(cfg_bytes):
+                        if not found_first_idr:
+                            found_first_idr = True
+                            first_idr_idx = len(v_media)
+                        v_media.append((pts_us, fl | 1, offset, actual_size))
+                    elif cfg_bytes not in seen_cfgs:
+                        seen_cfgs.add(cfg_bytes)
+                        v_cfg.append((pts_us, fl, offset, actual_size))
+                else:
+                    if not found_first_idr:
+                        if (fl & 1) != 0:
+                            found_first_idr = True
+                            first_idr_idx = len(v_media)
+                        else:
+                            vfh.seek(offset)
+                            probe_bytes = vfh.read(min(actual_size, 4096))
+                            if _contains_idr_nal(probe_bytes):
+                                fl |= 1
+                                found_first_idr = True
+                                first_idr_idx = len(v_media)
+                    v_media.append((pts_us, fl, offset, actual_size))
+
+        if found_first_idr and first_idr_idx and first_idr_idx > 0:
+            v_media = v_media[first_idr_idx:]
+        if not v_media:
             return [], [], [], 0, 16_666_667, None
 
+        v_media_pts0 = v_media[0][0]
         audio_firsts = []
         if g_raw:
             audio_firsts.append(g_raw[0][0])
@@ -480,30 +544,24 @@ class GStreamerPipeline:
         if min_audio_pts0 is not None and abs(v_media_pts0 - min_audio_pts0) > 60_000_000:
             v_shift_us = min_audio_pts0 - v_media_pts0
 
-        v_shifted_media0 = v_media_pts0 + v_shift_us
-        candidates = [v_shifted_media0]
-        if min_audio_pts0 is not None:
-            candidates.append(min_audio_pts0)
-        base_pts_us = min(candidates)
+        # Always anchor t=0 to the first valid video IDR frame so mp4mux writes media_time=0 (no elst black gap)
+        base_pts_us = v_media_pts0 + v_shift_us
 
-        # Normalize video packets: keep codec config at first media frame PTS; enforce strict monotonic PTS
-        first_v_norm_us = max(0, v_shifted_media0 - base_pts_us)
         v_plan = []  # (mode='file', pts_ns, dts_ns, dur_ns, offset, size, is_config)
+        for _, _, offset, size in v_cfg:
+            v_plan.append(("file", 0, 0, 0, offset, size, True))
+
         v_media_entries = []
         prev_v_us = -1
 
-        for pts_us, fl, offset, size in v_raw:
-            is_cfg = (fl & 2) != 0
-            if is_cfg:
-                v_plan.append(("file", first_v_norm_us * 1000, first_v_norm_us * 1000, 0, offset, size, True))
-            else:
-                norm_us = max(0, (pts_us + v_shift_us) - base_pts_us)
-                if prev_v_us >= 0 and norm_us <= prev_v_us:
-                    norm_us = prev_v_us + 1
-                prev_v_us = norm_us
-                idx_in_plan = len(v_plan)
-                v_plan.append(["file", norm_us * 1000, norm_us * 1000, 16_666_667, offset, size, False])
-                v_media_entries.append((idx_in_plan, norm_us))
+        for pts_us, _, offset, size in v_media:
+            norm_us = max(0, (pts_us + v_shift_us) - base_pts_us)
+            if prev_v_us >= 0 and norm_us <= prev_v_us:
+                norm_us = prev_v_us + 1
+            prev_v_us = norm_us
+            idx_in_plan = len(v_plan)
+            v_plan.append(["file", norm_us * 1000, norm_us * 1000, 16_666_667, offset, size, False])
+            v_media_entries.append((idx_in_plan, norm_us))
 
         if not v_media_entries:
             return [], [], [], 0, 16_666_667, None
@@ -520,19 +578,37 @@ class GStreamerPipeline:
         median_v_dur_us = sorted(deltas_us)[len(deltas_us) // 2] if deltas_us else 16_667
         median_v_dur_us = max(16_667, min(median_v_dur_us, 100_000))
 
-        # Normalize audio packets (preserving start offsets and detecting any gaps cleanly)
+        # Normalize audio packets relative to Video Frame 0, trimming pre-video PCM on sample boundaries
         def build_audio_plan(raw_list, bytes_per_sec, file_limit):
             plan = []
             prev_end_ns = 0
+            frame_align = 4 if bytes_per_sec == 192000 else 2
             for pts_us, _, offset, size in raw_list:
                 if offset >= file_limit:
                     continue
                 actual_size = min(size, file_limit - offset)
-                frame_align = 4 if bytes_per_sec == 192000 else 2
                 actual_size -= actual_size % frame_align
                 if actual_size <= 0:
                     continue
-                pts_ns = max(0, (pts_us - base_pts_us) * 1000)
+
+                rel_start_us = pts_us - base_pts_us
+                dur_us = (actual_size * 1_000_000) // bytes_per_sec
+                if rel_start_us < 0:
+                    if rel_start_us + dur_us <= 0:
+                        continue
+                    skip_bytes = ((-rel_start_us) * bytes_per_sec) // 1_000_000
+                    skip_bytes -= skip_bytes % frame_align
+                    if skip_bytes >= actual_size:
+                        continue
+                    offset += skip_bytes
+                    actual_size -= skip_bytes
+                    actual_size -= actual_size % frame_align
+                    if actual_size <= 0:
+                        continue
+                    trimmed_pts_us = pts_us + (skip_bytes * 1_000_000) // bytes_per_sec
+                    rel_start_us = max(0, trimmed_pts_us - base_pts_us)
+
+                pts_ns = rel_start_us * 1000
                 if prev_end_ns > 0 and 0 < (prev_end_ns - pts_ns) < 5_000_000:
                     pts_ns = prev_end_ns
                 dur_ns = (actual_size * 1_000_000_000) // bytes_per_sec

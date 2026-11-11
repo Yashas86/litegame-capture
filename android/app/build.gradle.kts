@@ -4,15 +4,15 @@ plugins {
 }
 
 android {
-    namespace = "com.example.lowloadcapture"
+    namespace = "com.litegame.capture"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.example.lowloadcapture"
+        applicationId = "com.litegame.capture"
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.0.0"
     }
 
     compileOptions {
@@ -23,7 +23,6 @@ android {
         jvmTarget = "17"
     }
 }
-
 
 dependencies {
     implementation("androidx.activity:activity-ktx:1.9.3")

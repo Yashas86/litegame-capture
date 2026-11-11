@@ -1,4 +1,4 @@
-package com.example.lowloadcapture
+package com.litegame.capture
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -14,14 +14,14 @@ object AudioMixer {
         micPcm: ByteArray,
         micLength: Int
     ): ByteArray {
-        val gameSampleCount = gameLength / 2 // total 16-bit samples in game (L R L R ...)
-        val gameFrameCount = gameSampleCount / 2 // total stereo frames
-        val micSampleCount = micLength / 2 // total 16-bit samples in mic (M M M ...)
+        val gameSampleCount = gameLength / 2
+        val gameFrameCount = gameSampleCount / 2
+        val micSampleCount = micLength / 2
 
         val frameCount = maxOf(gameFrameCount, micSampleCount)
         if (frameCount == 0) return ByteArray(0)
 
-        val outputBytes = ByteArray(frameCount * 4) // 2 channels * 2 bytes = 4 bytes per stereo frame
+        val outputBytes = ByteArray(frameCount * 4)
         val gameBb = ByteBuffer.wrap(gamePcm, 0, gameLength).order(ByteOrder.LITTLE_ENDIAN)
         val micBb = ByteBuffer.wrap(micPcm, 0, micLength).order(ByteOrder.LITTLE_ENDIAN)
         val outBb = ByteBuffer.wrap(outputBytes).order(ByteOrder.LITTLE_ENDIAN)
@@ -31,7 +31,6 @@ object AudioMixer {
             val gameR = if (i * 2 + 1 < gameSampleCount) gameBb.short.toInt() else 0
             val micM = if (i < micSampleCount) micBb.short.toInt() else 0
 
-            // Mix mic into both L and R channels with gain scaling
             val mixedL = (gameL + micM).coerceIn(-32768, 32767).toShort()
             val mixedR = (gameR + micM).coerceIn(-32768, 32767).toShort()
 

@@ -102,11 +102,19 @@ class _GstRuntime:
         g.gst_buffer_new_allocate.restype = ctypes.c_void_p
         g.gst_buffer_fill.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
         g.gst_buffer_fill.restype = ctypes.c_size_t
+        g.gst_buffer_get_size.argtypes = [ctypes.c_void_p]
+        g.gst_buffer_get_size.restype = ctypes.c_size_t
+        g.gst_buffer_extract.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
+        g.gst_buffer_extract.restype = ctypes.c_size_t
+        g.gst_sample_get_buffer.argtypes = [ctypes.c_void_p]
+        g.gst_sample_get_buffer.restype = ctypes.c_void_p
 
         a.gst_app_src_push_buffer.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         a.gst_app_src_push_buffer.restype = ctypes.c_int
         a.gst_app_src_end_of_stream.argtypes = [ctypes.c_void_p]
         a.gst_app_src_end_of_stream.restype = ctypes.c_int
+        a.gst_app_sink_try_pull_sample.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+        a.gst_app_sink_try_pull_sample.restype = ctypes.c_void_p
 
         gl.g_error_free.argtypes = [ctypes.c_void_p]
         gl.g_free.argtypes = [ctypes.c_void_p]

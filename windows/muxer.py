@@ -3,17 +3,17 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 try:
-    from utils import find_ffmpeg_executable, get_subprocess_kwargs
+    from utils import find_ffmpeg_executable, get_default_recordings_dir, get_subprocess_kwargs
     from gstreamer_pipeline import GStreamerPipeline
 except ImportError:
-    from windows.utils import find_ffmpeg_executable, get_subprocess_kwargs
+    from windows.utils import find_ffmpeg_executable, get_default_recordings_dir, get_subprocess_kwargs
     from windows.gstreamer_pipeline import GStreamerPipeline
 
 
 class MP4Muxer:
     def __init__(self, recordings_dir=None):
         if recordings_dir is None:
-            self.recordings_dir = Path(__file__).parent.parent / "recordings"
+            self.recordings_dir = get_default_recordings_dir()
         else:
             self.recordings_dir = Path(recordings_dir)
         self.recordings_dir.mkdir(parents=True, exist_ok=True)
@@ -24,7 +24,7 @@ class MP4Muxer:
         video_path,
         game_audio_path=None,
         phone_mic_path=None,
-        custom_prefix="BGMI",
+        custom_prefix="LiteGame",
         include_game_audio=True,
         include_phone_mic=True,
         audio_delay_ms=0,

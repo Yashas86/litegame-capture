@@ -1,14 +1,10 @@
-# Windows receiver
+# Windows Receiver & Desktop Suite
 
-Run `py -m pip install -r requirements.txt`.
+See the repository root [README.md](../README.md) for full installation, setup, and usage instructions.
 
-Start receiver:
-`py receiver.py --output ..\recordings`
+Quick start from source:
+1. `powershell -ExecutionPolicy Bypass -File setup_dependencies.ps1`
+2. `py -3.12 gui.py`
 
-With PC microphone:
-`py receiver.py --output ..\recordings --pc-mic`
-
-List input devices:
-`py receiver.py --list-mics`
-
-The receiver binds only to 127.0.0.1. Use `adb reverse tcp:27183 tcp:27183` while the phone is connected and authorized.
+Build standalone Windows executable:
+`powershell -ExecutionPolicy Bypass -File build_windows.ps1`

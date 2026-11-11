@@ -133,7 +133,7 @@ def receive(args):
         print("Saved files to:", out)
 
 def main():
-    p = argparse.ArgumentParser(description="LowLoadCapture USB receiver")
+    p = argparse.ArgumentParser(description="LiteGame Capture USB receiver")
     p.add_argument("--port", type=int, default=PORT)
     p.add_argument("--output", default="recordings")
     p.add_argument("--pc-mic", action="store_true")

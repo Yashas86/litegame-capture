@@ -1,25 +1,38 @@
-package com.example.lowloadcapture
+package com.litegame.capture
 
 import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
-import android.media.*
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioPlaybackCaptureConfiguration
+import android.media.AudioRecord
+import android.media.AudioTimestamp
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaFormat
+import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.IBinder
+import android.os.Process
 import android.util.Log
 import android.view.Surface
 import java.io.BufferedOutputStream
-import java.io.DataOutputStream
+import java.io.InputStream
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -29,19 +42,23 @@ import kotlin.math.abs
 
 class CaptureService : Service() {
     companion object {
-        const val ACTION_START = "com.example.lowloadcapture.START"
-        const val ACTION_STOP = "com.example.lowloadcapture.STOP"
+        const val ACTION_START = "com.litegame.capture.START"
+        const val ACTION_STOP = "com.litegame.capture.STOP"
         const val EXTRA_RESULT_CODE = "resultCode"
         const val EXTRA_RESULT_DATA = "resultData"
+        const val EXTRA_WIDTH = "width"
+        const val EXTRA_HEIGHT = "height"
+        const val EXTRA_FPS = "fps"
         const val EXTRA_BITRATE = "bitrate"
-        
-        private const val TAG = "LowLoadCapture"
+
+        private const val TAG = "LiteGameCapture"
         private const val PORT = 27183
         private const val DEFAULT_WIDTH = 1920
         private const val DEFAULT_HEIGHT = 1080
-        private const val FPS = 60
+        private const val DEFAULT_FPS = 60
         private const val DEFAULT_BITRATE = 8_000_000
         private const val MAX_QUEUE_SIZE = 2000
+        private const val MAX_POOL_BUFFERS = 96
 
         const val TRACK_VIDEO = 1
         const val TRACK_GAME_AUDIO = 2
@@ -56,22 +73,35 @@ class CaptureService : Service() {
         @Volatile
         var activeRecordStartMs: Long = 0L
             private set
+
+        @Volatile
+        var activeProfileLabel: String = "1080p60"
+            private set
     }
 
     private class Packet(
-        val track: Int,
-        val flags: Int,
-        val sequence: Int,
-        val ptsUs: Long,
-        val payload: ByteArray
+        var track: Int = 0,
+        var flags: Int = 0,
+        var sequence: Int = 0,
+        var ptsUs: Long = 0L,
+        var length: Int = 0,
+        var payload: ByteArray = ByteArray(0),
+        var pooled: Boolean = false
     )
 
     private val running = AtomicBoolean(false)
     private val packetQueue = LinkedBlockingQueue<Packet>(MAX_QUEUE_SIZE)
     private val sequenceCounter = AtomicInteger(0)
 
+    // Reusable pools keep ART GC pauses near zero during heavy BGMI gameplay
+    private val packetPool = ConcurrentLinkedQueue<Packet>()
+    private val gameAudioPool = ConcurrentLinkedQueue<ByteArray>()
+    private val micAudioPool = ConcurrentLinkedQueue<ByteArray>()
+    private val videoBufferPool = ConcurrentLinkedQueue<ByteArray>()
+
     private var socket: Socket? = null
-    private var output: DataOutputStream? = null
+    private var output: BufferedOutputStream? = null
+    private var input: InputStream? = null
     private var projection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var encoder: MediaCodec? = null
@@ -81,9 +111,9 @@ class CaptureService : Service() {
 
     private var captureWidth = DEFAULT_WIDTH
     private var captureHeight = DEFAULT_HEIGHT
+    private var captureFps = DEFAULT_FPS
     private var captureBitrate = DEFAULT_BITRATE
 
-    // Single shared clock baseline for both video and audio streams
     @Volatile
     private var captureStartNs: Long = 0L
 
@@ -100,6 +130,7 @@ class CaptureService : Service() {
     private var gameAudioThread: Thread? = null
     private var phoneMicThread: Thread? = null
     private var networkWriterThread: Thread? = null
+    private var controlReaderThread: Thread? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -109,10 +140,15 @@ class CaptureService : Service() {
             return START_NOT_STICKY
         }
         if (intent?.action == ACTION_START && !running.get()) {
+            captureWidth = intent.getIntExtra(EXTRA_WIDTH, DEFAULT_WIDTH).coerceAtLeast(640)
+            captureHeight = intent.getIntExtra(EXTRA_HEIGHT, DEFAULT_HEIGHT).coerceAtLeast(360)
+            captureFps = intent.getIntExtra(EXTRA_FPS, DEFAULT_FPS).coerceIn(24, 60)
+            captureBitrate = intent.getIntExtra(EXTRA_BITRATE, DEFAULT_BITRATE).coerceIn(1_500_000, 20_000_000)
+            activeProfileLabel = "${captureHeight}p${captureFps}"
+
             startForegroundCompat()
             val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
-            captureBitrate = intent.getIntExtra(EXTRA_BITRATE, DEFAULT_BITRATE)
-            
+
             @Suppress("DEPRECATION")
             val data = if (Build.VERSION.SDK_INT >= 33) {
                 intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
@@ -120,7 +156,8 @@ class CaptureService : Service() {
                 intent.getParcelableExtra(EXTRA_RESULT_DATA)
             }
             if (data == null) {
-                Log.e(TAG, "Missing result data intent")
+                Log.e(TAG, "Missing MediaProjection result intent")
+                stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
                 return START_NOT_STICKY
             }
@@ -129,7 +166,7 @@ class CaptureService : Service() {
                 try {
                     startCapture(resultCode, data)
                 } catch (t: Throwable) {
-                    Log.e(TAG, "Capture failed to start", t)
+                    Log.e(TAG, "Capture failed to start: ${t.message}")
                     stopCapture()
                 }
             }
@@ -138,22 +175,39 @@ class CaptureService : Service() {
     }
 
     private fun startForegroundCompat() {
-        val channelId = "lowloadcapture_v21"
+        val channelId = "litegame_capture_channel"
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= 26) {
             nm.createNotificationChannel(
-                NotificationChannel(channelId, "LowLoadCapture v2.1", NotificationManager.IMPORTANCE_LOW)
+                NotificationChannel(channelId, "LiteGame Capture", NotificationManager.IMPORTANCE_LOW)
             )
         }
-        val notification = if (Build.VERSION.SDK_INT >= 26) {
+
+        val stopIntent = Intent(this, CaptureService::class.java).apply { action = ACTION_STOP }
+        val stopFlags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        val stopPending = PendingIntent.getService(this, 1, stopIntent, stopFlags)
+
+        val openIntent = Intent(this, MainActivity::class.java)
+        val openPending = PendingIntent.getActivity(this, 2, openIntent, stopFlags)
+
+        val builder = if (Build.VERSION.SDK_INT >= 26) {
             Notification.Builder(this, channelId)
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
-        }.setContentTitle("LowLoadCapture v2.1 Active")
-            .setContentText("Streaming 1080p60 capture & dual audio to Windows PC")
+        }
+
+        val notification = builder
+            .setContentTitle("LiteGame Capture Active ($activeProfileLabel)")
+            .setContentText("Recording hardware stream over USB")
             .setSmallIcon(android.R.drawable.presence_video_online)
             .setOngoing(true)
+            .setContentIntent(openPending)
+            .addAction(
+                Notification.Action.Builder(
+                    null as android.graphics.drawable.Icon?, "Stop", stopPending
+                ).build()
+            )
             .build()
 
         if (Build.VERSION.SDK_INT >= 29) {
@@ -164,20 +218,17 @@ class CaptureService : Service() {
     }
 
     private fun startCapture(resultCode: Int, data: Intent) {
-        // Set single shared clock baseline for synchronized video & audio timestamps
         captureStartNs = System.nanoTime()
         lastVideoPtsUs = -1L
         isVideoEOS = false
 
-        // Connect to ADB-reversed localhost socket on Windows
-        Log.i(TAG, "Connecting to socket localhost:$PORT...")
         val s = Socket()
         s.connect(InetSocketAddress("127.0.0.1", PORT), 5000)
         s.tcpNoDelay = true
         s.sendBufferSize = 1024 * 1024
         socket = s
-        output = DataOutputStream(BufferedOutputStream(s.getOutputStream(), 1024 * 1024))
-        Log.i(TAG, "Socket connected successfully")
+        output = BufferedOutputStream(s.getOutputStream(), 1024 * 1024)
+        input = s.getInputStream()
 
         val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         projection = mgr.getMediaProjection(resultCode, data)
@@ -188,8 +239,8 @@ class CaptureService : Service() {
         isRecordingActive = true
         activeRecordStartMs = System.currentTimeMillis()
 
-        // Start network writer thread first
         networkWriterThread = thread(name = "NetworkWriter") { networkWriterLoop() }
+        controlReaderThread = thread(name = "ControlReader") { controlReaderLoop() }
 
         val codec = createEncoder()
         encoder = codec
@@ -198,13 +249,12 @@ class CaptureService : Service() {
 
         mp.registerCallback(object : MediaProjection.Callback() {
             override fun onStop() {
-                Log.i(TAG, "MediaProjection callback onStop()")
                 stopCapture()
             }
         }, null)
 
         virtualDisplay = mp.createVirtualDisplay(
-            "LowLoadCapture-1080p60",
+            "LiteGameCapture-$activeProfileLabel",
             captureWidth,
             captureHeight,
             resources.displayMetrics.densityDpi,
@@ -219,88 +269,115 @@ class CaptureService : Service() {
     }
 
     private fun createEncoder(): MediaCodec {
-        val encoderInfo = EncoderChecker.checkEncoder()
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, captureWidth, captureHeight).apply {
+        val encoderInfo = EncoderChecker.checkEncoder(captureWidth, captureHeight, captureFps.toDouble())
+        val baseFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, captureWidth, captureHeight).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, captureBitrate)
-            setInteger(MediaFormat.KEY_FRAME_RATE, FPS)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            setInteger(MediaFormat.KEY_FRAME_RATE, captureFps)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
             if (Build.VERSION.SDK_INT >= 23) setInteger(MediaFormat.KEY_PRIORITY, 0)
             if (Build.VERSION.SDK_INT >= 29) setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
         }
 
-        Log.i(TAG, "Initializing hardware video encoder: ${encoderInfo.encoderName}")
-        return MediaCodec.createByCodecName(encoderInfo.encoderName).apply {
-            configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        val codec = MediaCodec.createByCodecName(encoderInfo.encoderName)
+        val tunedFormat = MediaFormat(baseFormat).apply {
+            setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+            if (Build.VERSION.SDK_INT >= 23) {
+                setInteger(MediaFormat.KEY_OPERATING_RATE, captureFps)
+            }
         }
+        try {
+            codec.configure(tunedFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        } catch (_: Exception) {
+            // Some low-end vendor codecs reject optional operating-rate or VBR keys
+            codec.configure(baseFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        }
+        return codec
+    }
+
+    private fun borrowVideoBuffer(minSize: Int): ByteArray {
+        val reused = videoBufferPool.poll()
+        return if (reused != null && reused.size >= minSize) reused else ByteArray(minSize.coerceAtLeast(65536))
     }
 
     private fun drainVideo(codec: MediaCodec) {
+        Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY)
         val info = MediaCodec.BufferInfo()
         val captureStartUs = captureStartNs / 1000L
         var videoPtsOffsetUs = Long.MIN_VALUE
 
         try {
             while (running.get()) {
-                val index = try {
+                var index = try {
                     codec.dequeueOutputBuffer(info, 10_000)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Video dequeue exception", e)
+                } catch (_: Exception) {
                     break
                 }
 
-                when {
-                    index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                        val fmt = codec.outputFormat
-                        for (key in listOf("csd-0", "csd-1")) {
-                            val csd = fmt.getByteBuffer(key)
-                            if (csd != null && csd.remaining() > 0) {
-                                val duplicate = csd.duplicate()
-                                val bytes = ByteArray(duplicate.remaining())
-                                duplicate.get(bytes)
-                                enqueuePacket(TRACK_VIDEO, MediaCodec.BUFFER_FLAG_CODEC_CONFIG, 0L, bytes)
+                while (running.get()) {
+                    when {
+                        index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                            val fmt = codec.outputFormat
+                            for (key in listOf("csd-0", "csd-1")) {
+                                val csd = fmt.getByteBuffer(key)
+                                if (csd != null && csd.remaining() > 0) {
+                                    val dup = csd.duplicate()
+                                    val size = dup.remaining()
+                                    val bytes = ByteArray(size)
+                                    dup.get(bytes)
+                                    enqueuePacket(TRACK_VIDEO, MediaCodec.BUFFER_FLAG_CODEC_CONFIG, 0L, bytes, size, pooled = false)
+                                }
                             }
                         }
-                        Log.i(TAG, "Encoder output format changed: $fmt")
-                    }
-                    index >= 0 -> {
-                        val buffer = codec.getOutputBuffer(index)
-                        if (buffer != null && info.size > 0) {
-                            buffer.position(info.offset)
-                            buffer.limit(info.offset + info.size)
-                            val bytes = ByteArray(info.size)
-                            buffer.get(bytes)
+                        index >= 0 -> {
+                            val buffer = codec.getOutputBuffer(index)
+                            if (buffer != null && info.size > 0) {
+                                buffer.position(info.offset)
+                                buffer.limit(info.offset + info.size)
+                                val buf = borrowVideoBuffer(info.size)
+                                buffer.get(buf, 0, info.size)
 
-                            val isConfig = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
-                            val ptsUs = if (isConfig) {
-                                lastVideoPtsUs.coerceAtLeast(0L)
-                            } else {
-                                val nowRelUs = ((System.nanoTime() - captureStartNs) / 1000L).coerceAtLeast(0L)
-                                if (videoPtsOffsetUs == Long.MIN_VALUE) {
-                                    // Prefer MediaCodec Surface presentationTimeUs if it uses the CLOCK_MONOTONIC epoch
-                                    val candidateUs = info.presentationTimeUs - captureStartUs
-                                    videoPtsOffsetUs = if (candidateUs in -1_000_000L..10_000_000L && abs(candidateUs - nowRelUs) < 2_000_000L) {
-                                        captureStartUs
-                                    } else {
-                                        info.presentationTimeUs - nowRelUs
+                                val isConfig = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                                val ptsUs = if (isConfig) {
+                                    lastVideoPtsUs.coerceAtLeast(0L)
+                                } else {
+                                    val nowRelUs = ((System.nanoTime() - captureStartNs) / 1000L).coerceAtLeast(0L)
+                                    if (videoPtsOffsetUs == Long.MIN_VALUE) {
+                                        val candidateUs = info.presentationTimeUs - captureStartUs
+                                        videoPtsOffsetUs = if (
+                                            candidateUs in -1_000_000L..10_000_000L &&
+                                            abs(candidateUs - nowRelUs) < 2_000_000L
+                                        ) {
+                                            captureStartUs
+                                        } else {
+                                            info.presentationTimeUs - nowRelUs
+                                        }
                                     }
+                                    var normalized = (info.presentationTimeUs - videoPtsOffsetUs).coerceAtLeast(0L)
+                                    if (lastVideoPtsUs >= 0L && normalized <= lastVideoPtsUs) {
+                                        normalized = lastVideoPtsUs + 1L
+                                    }
+                                    lastVideoPtsUs = normalized
+                                    normalized
                                 }
-                                var normalized = (info.presentationTimeUs - videoPtsOffsetUs).coerceAtLeast(0L)
-                                if (lastVideoPtsUs >= 0L && normalized <= lastVideoPtsUs) {
-                                    normalized = lastVideoPtsUs + 1L
-                                }
-                                lastVideoPtsUs = normalized
-                                normalized
+                                enqueuePacket(TRACK_VIDEO, info.flags, ptsUs, buf, info.size, pooled = true)
                             }
-                            enqueuePacket(TRACK_VIDEO, info.flags, ptsUs, bytes)
+                            codec.releaseOutputBuffer(index, false)
                         }
-                        codec.releaseOutputBuffer(index, false)
+                        else -> break
                     }
+
+                    // Drain any extra queued buffers immediately without waiting another 10ms timeout
+                    index = try {
+                        codec.dequeueOutputBuffer(info, 0)
+                    } catch (_: Exception) {
+                        MediaCodec.INFO_TRY_AGAIN_LATER
+                    }
+                    if (index == MediaCodec.INFO_TRY_AGAIN_LATER) break
                 }
             }
         } finally {
             isVideoEOS = true
-            Log.i(TAG, "Video drain finished at lastVideoPtsUs=$lastVideoPtsUs")
         }
     }
 
@@ -308,7 +385,7 @@ class CaptureService : Service() {
     private fun startAudioCapture(mp: MediaProjection) {
         val sampleRate = 48000
 
-        // 1. Game Audio (AudioPlaybackCapture - 48kHz Stereo)
+        // 1. Internal Game Audio (AudioPlaybackCapture - 48kHz Stereo)
         try {
             val playbackConfig = AudioPlaybackCaptureConfiguration.Builder(mp)
                 .addMatchingUsage(AudioAttributes.USAGE_GAME)
@@ -333,16 +410,14 @@ class CaptureService : Service() {
 
             if (gameAudio?.state == AudioRecord.STATE_INITIALIZED) {
                 gameAudio?.startRecording()
-                Log.i(TAG, "Game audio capture initialized successfully")
                 gameAudioThread = thread(name = "GameAudioDrain") {
-                    drainAudioTrack(gameAudio!!, TRACK_GAME_AUDIO, 2)
+                    drainAudioTrack(gameAudio!!, TRACK_GAME_AUDIO, 2, gameAudioPool)
                 }
             } else {
-                Log.w(TAG, "Game audio record state not initialized")
                 gameAudio = null
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to initialize Game Audio capture: ${e.message}")
+            Log.w(TAG, "Game audio init skipped: ${e.message}")
             gameAudio = null
         }
 
@@ -366,28 +441,33 @@ class CaptureService : Service() {
 
             if (phoneMic?.state == AudioRecord.STATE_INITIALIZED) {
                 phoneMic?.startRecording()
-                Log.i(TAG, "Phone mic capture initialized successfully")
                 phoneMicThread = thread(name = "PhoneMicDrain") {
-                    drainAudioTrack(phoneMic!!, TRACK_PHONE_MIC, 1)
+                    drainAudioTrack(phoneMic!!, TRACK_PHONE_MIC, 1, micAudioPool)
                 }
             } else {
-                Log.w(TAG, "Phone mic record state not initialized")
                 phoneMic = null
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to initialize Phone Mic capture: ${e.message}")
+            Log.w(TAG, "Phone mic init skipped: ${e.message}")
             phoneMic = null
         }
     }
 
-    private fun drainAudioTrack(record: AudioRecord, trackId: Int, channels: Int) {
+    private fun drainAudioTrack(
+        record: AudioRecord,
+        trackId: Int,
+        channels: Int,
+        pool: ConcurrentLinkedQueue<ByteArray>
+    ) {
+        Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
         val sampleRate = 48000
-        val buffer = ByteArray(2048 * channels * 2) // ~42.67ms chunk
+        val chunkBytes = 2048 * channels * 2 // ~42.67ms
         var framesRead = 0L
         var expectedNextPtsUs = -1L
         val audioTs = AudioTimestamp()
 
         while (running.get()) {
+            val buffer = pool.poll() ?: ByteArray(chunkBytes)
             val read = record.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
             if (read > 0) {
                 val readDoneNs = System.nanoTime()
@@ -404,7 +484,8 @@ class CaptureService : Service() {
                         AudioRecord.ERROR_INVALID_OPERATION
                     }
                     if (tsResult == AudioRecord.SUCCESS && audioTs.nanoTime > 0L) {
-                        val hwChunkStartNs = audioTs.nanoTime + ((framesRead - audioTs.framePosition) * 1_000_000_000L) / sampleRate
+                        val hwChunkStartNs =
+                            audioTs.nanoTime + ((framesRead - audioTs.framePosition) * 1_000_000_000L) / sampleRate
                         val hwPtsUs = ((hwChunkStartNs - captureStartNs) / 1000L).coerceAtLeast(0L)
                         if (abs(hwPtsUs - wallStartUs) <= 150_000L) {
                             anchoredUs = hwPtsUs
@@ -414,62 +495,132 @@ class CaptureService : Service() {
                     val ptsUs = if (expectedNextPtsUs < 0L) {
                         anchoredUs
                     } else if (abs(anchoredUs - expectedNextPtsUs) <= 45_000L) {
-                        // Keep contiguous sample timing across minor thread scheduling jitter
                         expectedNextPtsUs
                     } else {
-                        // Re-anchor cleanly if AudioRecord experienced an overrun or stall gap
                         maxOf(anchoredUs, expectedNextPtsUs)
                     }
 
                     expectedNextPtsUs = ptsUs + chunkDurUs
                     framesRead += frameCount
-                    enqueuePacket(trackId, 0, ptsUs, buffer.copyOf(aligned))
+                    enqueuePacket(trackId, 0, ptsUs, buffer, aligned, pooled = true)
+                } else if (pool.size < MAX_POOL_BUFFERS) {
+                    pool.offer(buffer)
                 }
-            } else if (read < 0) {
-                Log.w(TAG, "AudioRecord read error track=$trackId code=$read")
-                break
+            } else {
+                if (pool.size < MAX_POOL_BUFFERS) pool.offer(buffer)
+                if (read < 0) break
             }
         }
     }
 
-    private fun enqueuePacket(track: Int, flags: Int, ptsUs: Long, payload: ByteArray) {
-        if (!running.get()) return
-        val seq = sequenceCounter.incrementAndGet() and 0xFFFF
-        val pkt = Packet(track, flags, seq, ptsUs, payload)
+    private fun enqueuePacket(
+        track: Int,
+        flags: Int,
+        ptsUs: Long,
+        payload: ByteArray,
+        length: Int,
+        pooled: Boolean
+    ) {
+        if (!running.get()) {
+            recyclePayload(track, payload, pooled)
+            return
+        }
+        val pkt = packetPool.poll() ?: Packet()
+        pkt.track = track
+        pkt.flags = flags
+        pkt.sequence = sequenceCounter.incrementAndGet() and 0xFFFF
+        pkt.ptsUs = ptsUs
+        pkt.length = length
+        pkt.payload = payload
+        pkt.pooled = pooled
 
-        try {
-            packetQueue.put(pkt)
-        } catch (_: InterruptedException) {
-            // Service stopping
+        if (!packetQueue.offer(pkt)) {
+            // Non-blocking drop recovery if USB stalls; avoids freezing encoder or BGMI
+            recyclePacket(pkt)
+        }
+    }
+
+    private fun recyclePayload(track: Int, payload: ByteArray, pooled: Boolean) {
+        if (!pooled || payload.isEmpty()) return
+        val targetPool = when (track) {
+            TRACK_VIDEO -> videoBufferPool
+            TRACK_GAME_AUDIO -> gameAudioPool
+            TRACK_PHONE_MIC -> micAudioPool
+            else -> return
+        }
+        if (targetPool.size < MAX_POOL_BUFFERS) {
+            targetPool.offer(payload)
+        }
+    }
+
+    private fun recyclePacket(pkt: Packet) {
+        recyclePayload(pkt.track, pkt.payload, pkt.pooled)
+        pkt.payload = ByteArray(0)
+        pkt.length = 0
+        pkt.pooled = false
+        if (packetPool.size < MAX_POOL_BUFFERS * 2) {
+            packetPool.offer(pkt)
         }
     }
 
     private fun networkWriterLoop() {
         val out = output ?: return
+        val headerBytes = ByteArray(20)
+        val headerBuf = ByteBuffer.wrap(headerBytes).order(ByteOrder.BIG_ENDIAN)
         var unwrittenCount = 0
+
         try {
             while ((!writerClosing && running.get()) || packetQueue.isNotEmpty()) {
                 val pkt = packetQueue.poll(50, TimeUnit.MILLISECONDS) ?: continue
+                headerBuf.clear()
+                headerBuf.put(0x4c).put(0x43).put(0x41).put(0x50) // LCAP
+                headerBuf.put(pkt.track.toByte())
+                headerBuf.put(pkt.flags.toByte())
+                headerBuf.putShort(pkt.sequence.toShort())
+                headerBuf.putLong(pkt.ptsUs)
+                headerBuf.putInt(pkt.length)
 
-                // LCAP v2 Header: 20 bytes
-                // 4B magic, 1B track, 1B flags, 2B sequence, 8B ptsUs, 4B size
-                out.write(byteArrayOf(0x4c, 0x43, 0x41, 0x50)) // LCAP
-                out.writeByte(pkt.track)
-                out.writeByte(pkt.flags)
-                out.writeShort(pkt.sequence)
-                out.writeLong(pkt.ptsUs)
-                out.writeInt(pkt.payload.size)
-                out.write(pkt.payload)
+                out.write(headerBytes, 0, 20)
+                if (pkt.length > 0) {
+                    out.write(pkt.payload, 0, pkt.length)
+                }
+                recyclePacket(pkt)
 
                 unwrittenCount++
-                if (unwrittenCount >= 20 || packetQueue.isEmpty()) {
+                if (unwrittenCount >= 16 || packetQueue.isEmpty()) {
                     out.flush()
                     unwrittenCount = 0
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "USB stream network write error: ${e.message}")
+            Log.e(TAG, "USB stream error: ${e.message}")
             running.set(false)
+        }
+    }
+
+    private fun controlReaderLoop() {
+        Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
+        val inp = input ?: return
+        val cmdBuf = ByteArray(4)
+        try {
+            while (running.get()) {
+                var readTotal = 0
+                while (readTotal < 4) {
+                    val n = inp.read(cmdBuf, readTotal, 4 - readTotal)
+                    if (n <= 0) return
+                    readTotal += n
+                }
+                if (cmdBuf[0] == 'S'.code.toByte() &&
+                    cmdBuf[1] == 'T'.code.toByte() &&
+                    cmdBuf[2] == 'O'.code.toByte() &&
+                    cmdBuf[3] == 'P'.code.toByte()
+                ) {
+                    stopCapture()
+                    return
+                }
+            }
+        } catch (_: Exception) {
+            // Socket closed during normal shutdown
         }
     }
 
@@ -485,7 +636,6 @@ class CaptureService : Service() {
             return
         }
 
-        Log.i(TAG, "Stopping capture service...")
         val stopPtsUs = if (captureStartNs > 0L) {
             ((System.nanoTime() - captureStartNs) / 1000L).coerceAtLeast(lastVideoPtsUs.coerceAtLeast(0L))
         } else {
@@ -499,11 +649,13 @@ class CaptureService : Service() {
         val enc = encoder.also { encoder = null }
         val vSurf = videoSurface.also { videoSurface = null }
         val outStream = output.also { output = null }
+        val inStream = input.also { input = null }
         val sock = socket.also { socket = null }
         val vThread = videoDrainThread.also { videoDrainThread = null }
         val gThread = gameAudioThread.also { gameAudioThread = null }
         val mThread = phoneMicThread.also { phoneMicThread = null }
         val wThread = networkWriterThread.also { networkWriterThread = null }
+        controlReaderThread = null
 
         try { gAudio?.stop() } catch (_: Exception) {}
         try { pMic?.stop() } catch (_: Exception) {}
@@ -519,14 +671,22 @@ class CaptureService : Service() {
             try { vThread?.join(300) } catch (_: Exception) {}
             try { gThread?.join(300) } catch (_: Exception) {}
             try { mThread?.join(300) } catch (_: Exception) {}
-            val seq = sequenceCounter.incrementAndGet() and 0xFFFF
-            packetQueue.offer(Packet(TRACK_VIDEO, FLAG_EOS, seq, stopPtsUs, ByteArray(0)))
+            val eosPkt = Packet(
+                track = TRACK_VIDEO,
+                flags = FLAG_EOS,
+                sequence = sequenceCounter.incrementAndGet() and 0xFFFF,
+                ptsUs = stopPtsUs,
+                length = 0,
+                payload = ByteArray(0),
+                pooled = false
+            )
+            packetQueue.offer(eosPkt)
             writerClosing = true
             try { wThread?.join(1000) } catch (_: Exception) {}
             try { outStream?.flush() } catch (_: Exception) {}
             try { outStream?.close() } catch (_: Exception) {}
+            try { inStream?.close() } catch (_: Exception) {}
             try { sock?.close() } catch (_: Exception) {}
-            Log.i(TAG, "Capture service stopped completely at stopPtsUs=$stopPtsUs")
         }
 
         stopForeground(STOP_FOREGROUND_REMOVE)

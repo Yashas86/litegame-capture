@@ -12,5 +12,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "LowLoadCapture"
+rootProject.name = "LiteGameCapture"
 include(":app")

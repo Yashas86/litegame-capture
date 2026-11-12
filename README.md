@@ -15,7 +15,7 @@ All video preview decoding, audio mixing, AAC encoding, and MP4 muxing run on yo
   - **Low Impact:** `720p @ 30 FPS` (`4 Mbps`) — ideal for low-end devices
   - **Balanced:** `1080p @ 30 FPS` (`6 Mbps`) — crisp 1080p for mid-range devices
   - **High Quality:** `1080p @ 60 FPS` (`8 Mbps`) — 60 FPS target when hardware-supported
-- **True VFR Playback Speed & A/V Sync:** Preserves exact per-frame Android presentation timestamps (`pts_us`) through a GStreamer `appsrc` + `h264parse` + `audiomixer` + `mp4mux` pipeline, eliminating fast-forwarding and audio/video drift.
+- **True VFR Playback Speed, Instant Start & A/V Sync:** Anchors timestamps directly to the first valid IDR keyframe (eliminating startup black-screen `elst` gaps) and preserves exact per-frame Android presentation timestamps (`pts_us`) through a GStreamer `appsrc` + `h264parse` + `audiomixer` + `mp4mux` pipeline.
 - **Independent Dual Audio:** Captures internal game audio (`AudioPlaybackCapture`, 48 kHz stereo) and phone microphone (`AudioRecord`, 48 kHz mono) separately, with live ON/OFF mute toggles on Windows.
 - **Optional Low-Latency PC Preview:** OFF by default for minimal PC load; toggle ON/OFF anytime during recording without interrupting the saved MP4.
 - **Privacy-First & Local-Only:** Works completely offline over USB (`127.0.0.1:27183`). No cloud accounts, no analytics, redacted device status, and recordings saved locally to `%USERPROFILE%\Videos\LiteGameCapture`.
@@ -60,27 +60,31 @@ All video preview decoding, audio mixing, AAC encoding, and MP4 muxing run on yo
 
 ---
 
-## Quick Installation (End Users)
+## How to Use (Step-by-Step)
 
-1. **Windows:** Download and extract the latest **LiteGame Capture Windows Release** ZIP, then run `LiteGameCapture.exe`.
-2. **Android:** Install `LiteGameCapture.apk` on your phone (enable "Install unknown apps" if prompted) and grant **Microphone** + **Notifications** permissions when opening the app.
-3. **Connect via USB:**
-   - Enable **Developer Options** on your phone (`Settings > About phone > Tap Build number 7 times`).
-   - Enable **USB Debugging** (`Settings > Developer options > USB debugging`).
-   - Connect your phone to your PC with a USB cable and tap **Allow** on the *"Allow USB debugging?"* prompt.
-   - Verify the Windows app shows **Android Device Connected** (`ADB Ready`).
+### Step 1: One-Time Phone Setup
+1. Open **Settings > About phone** on your Android phone and tap **Build number** 7 times to unlock **Developer options**.
+2. Go to **Settings > System > Developer options** (location varies slightly by brand) and enable **USB debugging**.
+3. Install `LiteGameCapture.apk` on your phone (download from **Releases**, or build `android\app\build\outputs\apk\debug\app-debug.apk`). Enable *"Install unknown apps"* if prompted.
+4. Open **LiteGame Capture** on the phone once and grant **Microphone** and **Notifications** permissions.
 
----
+### Step 2: Connect Phone to PC
+1. Extract the **LiteGame Capture Windows Release** ZIP on your PC and run `LiteGameCapture.exe` (or run `py -3.12 windows\gui.py` from source).
+2. Plug your phone into your PC using a **USB data cable**.
+3. On your phone, tap **Allow** (optionally check *"Always allow from this computer"*) on the *"Allow USB debugging?"* prompt.
+4. Confirm the Windows app status changes to **Android Device Connected** (`ADB Ready`).
 
-## How to Record Gameplay
-
-1. Open **LiteGame Capture** on Windows.
-2. Open **LiteGame Capture** on your Android phone (or click **Start Recording** in the Windows app to bring up the capture prompt on your phone).
-3. Choose a profile on the phone (**Low Impact 720p30**, **Balanced 1080p30**, or **High Quality 1080p60**) and tap **START RECORDING**.
-4. Approve Android's *"Start recording or casting?"* prompt, then switch to **BGMI**.
-5. *(Optional)* On Windows, toggle **Preview**, **Game Audio**, or **Phone Mic** live at any time.
-6. When finished, click **Stop Recording** in the Windows app, tap **Stop** in the Android notification, or return to the Android app and tap **STOP RECORDING**.
-7. Your finalized `.mp4` is saved automatically to:
+### Step 3: Record BGMI / Gameplay
+1. Pick a video profile in the Android app:
+   - **Low Impact (`720p30`):** Best for low-end phones or heavy thermal throttling.
+   - **Balanced (`1080p30`):** Crisp 1080p with modest GPU/encoder load.
+   - **High Quality (`1080p60`):** Up to 60 FPS on capable devices.
+2. Open **BGMI** (or launch it right after starting capture).
+3. Start recording either by tapping **START RECORDING** on the phone or clicking **Start Recording** in the Windows app (then approve Android's *"Start recording or casting?"* dialog).
+4. *(Optional on Windows)* Use **Preview**, **Game Audio**, and **Phone Mic** toggles live without interrupting the recording:
+   - **Preview** is **OFF** by default to keep PC overhead minimal; turning it ON/OFF does not affect the saved MP4.
+5. Stop recording anytime via **Stop Recording** on Windows, the **Stop** action in the Android notification, or **STOP RECORDING** inside the Android app.
+6. Wait a moment for muxing to finish. Your `.mp4` is saved automatically to:
    ```text
    %USERPROFILE%\Videos\LiteGameCapture\
    ```
@@ -91,7 +95,7 @@ All video preview decoding, audio mixing, AAC encoding, and MP4 muxing run on yo
 
 ### 1. Clone the Repository
 ```powershell
-git clone https://github.com/<your-org>/litegame-capture.git
+git clone https://github.com/<your-username>/litegame-capture.git
 cd litegame-capture
 ```
 

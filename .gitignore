@@ -36,6 +36,9 @@ android/local.properties
 *.jks
 *.pem
 *.p12
+keystore.properties
+**/keystore.properties
+signing.properties
 
 # IDE & Local Environment
 .idea/

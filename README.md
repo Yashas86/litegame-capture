@@ -117,13 +117,23 @@ powershell -ExecutionPolicy Bypass -File windows\build_windows.ps1
 ```
 Output executable: `windows\dist\LiteGameCapture\LiteGameCapture.exe`.
 
-### 4. Build Android APK
+### 4. Build Android APK (Debug & Release)
 Requirements: JDK 17 (or Android Studio JBR) and Android SDK (API 35). Set `ANDROID_HOME` (or `android\local.properties` with `sdk.dir=...`):
+
+**Debug APK:**
 ```powershell
 cd android
 .\gradlew.bat assembleDebug
 ```
 Output APK: `android\app\build\outputs\apk\debug\app-debug.apk`.
+
+**Signed Release APK (R8 shrinking enabled):**
+Configure signing credentials **outside version control** using either `LITEGAME_KEYSTORE_*` environment variables or `%USERPROFILE%\.litegame-capture\signing\keystore.properties` (see [android/keystore.properties.example](android/keystore.properties.example)), then run:
+```powershell
+cd android
+.\gradlew.bat assembleRelease
+```
+Output APK: `android\app\build\outputs\apk\release\app-release.apk`.
 
 ### 5. Run Automated Windows Tests
 ```powershell
